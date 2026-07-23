@@ -1,0 +1,194 @@
+trigger:
+  branches:
+    include:
+      - main
+
+pr:
+  branches:
+   include:
+     - main
+
+pool:
+  name: 'Azure-VM-Agent-VM-For-Deployment'
+
+variables:
+  terraformWorkingDirectory: "infra"
+  terraformVersion: "1.15.8"
+  azureServiceConnection: "AzureDevops-Connection"
+  environmentName: "prod"
+
+stages:
+  - stage: Validate
+    displayName: "Validate Terraform"
+    jobs:
+      - job: Validate
+        displayName: "Validating Prereqisite (Terraform, TF State Container etc.)"
+        steps:
+          - checkout: self
+          - task: PowerShell@2
+            displayName: "Checking Terraform Version"
+            name: TFCheck
+            inputs:
+              targetType: 'inline'
+              script: |
+                # Check if terraform executable exists in the system PATH
+                if (Get-Command terraform -ErrorAction SilentlyContinue) {
+                    # Get the version string (usually the first line of terraform -v)
+                    $versionOutput = (terraform -v | Select-Object -First 1)
+                    
+                    # Extract the semantic version number (1.15.8) using regex
+                    if ($versionOutput -match '(\d+\.\d+\.\d+)') {
+                        $currentVer = $Matches[1]
+                        Write-Host "Found local Terraform version: $currentVer"
+                        
+                        # Compare with the target version variable
+                        if ($currentVer -eq "$(terraformVersion)") {
+                            Write-Host "Target version matches. Skipping installation."
+                            Write-Host "##vso[task.setvariable variable=skipInstall;isOutput=true]true"
+                        } else {
+                            Write-Host "Version mismatch. Proceeding with installation."
+                            Write-Host "##vso[task.setvariable variable=skipInstall;isOutput=true]false"
+                        }
+                    } else {
+                        Write-Host "Could not parse version output. Proceeding with installation."
+                        Write-Host "##vso[task.setvariable variable=skipInstall;isOutput=true]false"
+                    }
+                } else {
+                    Write-Host "Terraform is not installed in the PATH. Proceeding with installation."
+                    Write-Host "##vso[task.setvariable variable=skipInstall;isOutput=true]false"
+                }
+
+          - task: TerraformInstaller@1
+            displayName: "Install Terraform"
+            condition: ne(variables['TFCheck.skipInstall'], 'true')
+            inputs:              
+              terraformVersion: "$(terraformVersion)"
+
+          - task: AzureCLI@2
+            displayName: "Checing Terraform State (TFState) Container Exists"
+            inputs:
+              azureSubscription: "$(azureServiceConnection)"
+              scriptType: "ps"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                $ErrorActionPreference = "Stop"
+                $containerExists = az storage container exists --name "tfstate" --account-name "devopsstorageaccount1975" --auth-mode login --query exists -o tsv
+                if ($containerExists -eq "false") {
+                      Write-Host "Container 'tfstate' not found. Creating it now..."
+                      az storage container create --name "tfstate" --account-name "devopsstorageaccount1975" --auth-mode login
+                  } else {
+                      Write-Host "Container 'tfstate' already exists."                      
+                  }
+
+          - task: AzureCLI@2
+            displayName: "Terraform fmt and validate"
+            inputs:
+              azureSubscription: "$(azureServiceConnection)"
+              addSpnToEnvironment: true
+              scriptType: "ps"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                $ErrorActionPreference = "Stop"
+
+                $env:TF_IN_AUTOMATION = "true"
+                $env:ARM_USE_OIDC = "true"
+                $env:ARM_USE_AZUREAD = "true"
+                $env:ARM_OIDC_TOKEN = "$env:idToken"
+                $env:ARM_CLIENT_ID = "$env:servicePrincipalId"
+                $env:ARM_TENANT_ID = "$env:tenantId"
+                $env:ARM_SUBSCRIPTION_ID = $(az account show --query id -o tsv)
+                $env:ARM_OIDC_AZURE_SERVICE_CONNECTION_ID = "$env:AZURESUBSCRIPTION_SERVICE_CONNECTION_ID"
+
+                Set-Location "$(terraformWorkingDirectory)"
+
+                terraform fmt -check -recursive
+                terraform init -input=false
+                terraform validate
+
+  - stage: Plan
+    displayName: "Plan Terraform"
+    dependsOn: Validate
+    jobs:
+      - job: Plan
+        displayName: "Creating Terraform plan"
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: "Terraform plan"
+            inputs:
+              azureSubscription: "$(azureServiceConnection)"
+              addSpnToEnvironment: true
+              scriptType: "ps"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                $ErrorActionPreference = "Stop"
+
+                $env:TF_IN_AUTOMATION = "true"
+                $env:ARM_USE_OIDC = "true"
+                $env:ARM_USE_AZUREAD = "true"
+                $env:ARM_OIDC_TOKEN = "$env:idToken"
+                $env:ARM_CLIENT_ID = "$env:servicePrincipalId"
+                $env:ARM_TENANT_ID = "$env:tenantId"
+                $env:ARM_SUBSCRIPTION_ID = $(az account show --query id -o tsv)
+                $env:ARM_OIDC_AZURE_SERVICE_CONNECTION_ID = "$env:AZURESUBSCRIPTION_SERVICE_CONNECTION_ID"
+
+                Set-Location "$(terraformWorkingDirectory)"
+
+                terraform init -input=false
+                Write-Host "Running terraform plan..."
+                terraform plan -input=false -out="main.tfplan" --var-file=prod.tfvars -lock-timeout=300s 
+                Write-Host "Ending terraform plan..."
+                terraform show -no-color main.tfplan | Out-File -FilePath "tfplan.txt" -Encoding ascii
+                dir
+                New-Item -ItemType Directory -Force -Path "$(Build.ArtifactStagingDirectory)/terraform-plan"
+                Copy-Item -Path "main.tfplan" -Destination "$(Build.ArtifactStagingDirectory)/terraform-plan/main.tfplan" -Force
+                Copy-Item -Path "tfplan.txt" -Destination "$(Build.ArtifactStagingDirectory)/terraform-plan/tfplan.txt" -Force
+
+          - publish: "$(Build.ArtifactStagingDirectory)/terraform-plan"
+            artifact: "terraform-plan"
+            displayName: "Publish Terraform plan artifact"
+
+  - stage: Apply
+    displayName: "Apply Terraform"
+    dependsOn: Plan
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: Apply
+        displayName: "Apply Terraform Action to production"
+        environment: "$(environmentName)"
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: DownloadPipelineArtifact@2
+                  displayName: "Downloading Terraform plan artifact"
+                  inputs:
+                    buildType: "current"
+                    artifactName: "terraform-plan"
+                    targetPath: "$(Pipeline.Workspace)/terraform-plan"
+
+                - task: AzureCLI@2
+                  displayName: "Terraform applying action"
+                  inputs:
+                    azureSubscription: "$(azureServiceConnection)"
+                    addSpnToEnvironment: true
+                    scriptType: "ps"
+                    scriptLocation: "inlineScript"
+                    inlineScript: |
+                      $ErrorActionPreference = "Stop"
+
+                      $env:TF_IN_AUTOMATION = "true"
+                      $env:ARM_USE_OIDC = "true"
+                      $env:ARM_USE_AZUREAD = "true"
+                      $env:ARM_OIDC_TOKEN = "$env:idToken"
+                      $env:ARM_CLIENT_ID = "$env:servicePrincipalId"
+                      $env:ARM_TENANT_ID = "$env:tenantId"
+                      $env:ARM_SUBSCRIPTION_ID = $(az account show --query id -o tsv)
+                      $env:ARM_OIDC_AZURE_SERVICE_CONNECTION_ID = "$env:AZURESUBSCRIPTION_SERVICE_CONNECTION_ID"
+
+                      Set-Location "$(terraformWorkingDirectory)"
+                      terraform init -input=false
+                      terraform apply -input=false -lock-timeout=300s "$(Pipeline.Workspace)/terraform-plan/main.tfplan"
