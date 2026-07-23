@@ -11,7 +11,7 @@ terraform {
  backend "azurerm" {
    resource_group_name  = "devops-rsg"
    storage_account_name = "devopsstorageaccount1975"
-   container_name       = "tfstate"
+   container_name       = "tfstate2"
    use_oidc             = true
    use_azuread_auth     = true      
    key                  = "terraform-azure-devops/prod.terraform.tfstate"
