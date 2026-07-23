@@ -72,12 +72,12 @@ stages:
               scriptLocation: "inlineScript"
               inlineScript: |
                 $ErrorActionPreference = "Stop"
-                $containerExists = az storage container exists --name "tfstate" --account-name "devopsstorageaccount1975" --auth-mode login --query exists -o tsv
+                $containerExists = az storage container exists --name "tfstate2" --account-name "devopsstorageaccount1975" --auth-mode login --query exists -o tsv
                 if ($containerExists -eq "false") {
-                      Write-Host "Container 'tfstate' not found. Creating it now..."
-                      az storage container create --name "tfstate" --account-name "devopsstorageaccount1975" --auth-mode login
+                      Write-Host "Container 'tfstate2' not found. Creating it now..."
+                      az storage container create --name "tfstate2" --account-name "devopsstorageaccount1975" --auth-mode login
                   } else {
-                      Write-Host "Container 'tfstate' already exists."                      
+                      Write-Host "Container 'tfstate2' already exists."                      
                   }
 
           - task: AzureCLI@2
